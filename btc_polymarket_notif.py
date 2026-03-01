@@ -1,4 +1,5 @@
 import os
+import re
 import time
 import json
 from typing import Dict, Any, List, Optional, Tuple
@@ -12,13 +13,18 @@ STATE_FILE = os.environ.get("STATE_FILE", "scanner_state.json")
 POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "10"))  # target: scan every 10s
 MAX_PAGES = int(os.environ.get("MAX_PAGES", "3"))         # 3 * 100 events/page
 
-KEYWORDS = [
+KEYWORDS_RAW = [
     k.strip().lower()
     for k in os.environ.get(
         "KEYWORDS", "btc,bitcoin,eth,ethereum,sol,solana"
     ).split(",")
     if k.strip()
 ]
+
+# Short tickers (btc/eth/sol) must match as full "words"
+KEYWORD_TOKENS = [k for k in KEYWORDS_RAW if len(k) <= 3]
+# Longer names (bitcoin/ethereum/solana) can be substring-matched
+KEYWORD_SUBSTRINGS = [k for k in KEYWORDS_RAW if len(k) > 3]
 
 EDGE_MIN = float(os.environ.get("EDGE_MIN", "0.03"))          # 3% edge
 SPIKE_DELTA = float(os.environ.get("SPIKE_DELTA", "0.12"))    # 12 points (0.12)
@@ -85,8 +91,32 @@ def market_url(slug: str) -> str:
 
 
 def hits(text: str) -> List[str]:
+    """
+    Return crypto keywords present in the text.
+    - Short tickers (btc/eth/sol) must appear as standalone tokens
+      to avoid matching 'eth' in 'health', etc.
+    - Longer names (bitcoin/ethereum/solana) can match as substrings.
+    """
     t = (text or "").lower()
-    return [k for k in KEYWORDS if k and k in t]
+    # tokenise to avoid 'eth' inside 'health'
+    tokens = set(re.findall(r"[a-z0-9$]+", t))
+
+    matched: List[str] = []
+    for k in KEYWORD_TOKENS:
+        if k in tokens:
+            matched.append(k)
+    for k in KEYWORD_SUBSTRINGS:
+        if k in t:
+            matched.append(k)
+
+    # de-duplicate while preserving order
+    seen: set = set()
+    result: List[str] = []
+    for k in matched:
+        if k not in seen:
+            seen.add(k)
+            result.append(k)
+    return result
 
 
 def parse_yes_no_prices(market: Dict[str, Any]) -> Optional[Tuple[float, float]]:
