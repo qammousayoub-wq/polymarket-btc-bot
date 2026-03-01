@@ -1,131 +1,292 @@
-import os, time, json
+import os
+import time
+import json
+import math
+from typing import Dict, Any, List, Optional, Tuple
+
 import requests
 
 GAMMA = "https://gamma-api.polymarket.com"
-KEYWORDS = ["btc", "bitcoin"]
-POLL_SECONDS = 30
-STATE_FILE = "btc_seen.json"
+STATE_FILE = os.environ.get("STATE_FILE", "scanner_state.json")
 
+# --- CONFIG (variables d'env possibles) ---
+POLL_SECONDS = int(os.environ.get("POLL_SECONDS", "30"))  # 15–60
+LIMIT = int(os.environ.get("LIMIT", "100"))               # events par page
+MAX_PAGES = int(os.environ.get("MAX_PAGES", "3"))         # 3 pages => 300 events
+
+# Mots-clés: "btc,bitcoin,eth,ethereum,sol,solana"
+KEYWORDS = [k.strip().lower() for k in os.environ.get(
+    "KEYWORDS",
+    "btc,bitcoin,eth,ethereum,sol,solana"
+).split(",") if k.strip()]
+
+# Arbitrage alert si YES+NO <= (1 - EDGE_MIN)
+EDGE_MIN = float(os.environ.get("EDGE_MIN", "0.03"))      # 0.03 = 3%
+# Spike alert si prix bouge de >= SPIKE_DELTA (ex: 0.15 = 15 points)
+SPIKE_DELTA = float(os.environ.get("SPIKE_DELTA", "0.15"))
+
+# Telegram
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
 
-def tg_send(text: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    requests.post(url, json={"chat_id": CHAT_ID, "text": text[:3900]}, timeout=20)
+# Anti-spam
+MAX_ALERTS_PER_CYCLE = int(os.environ.get("MAX_ALERTS_PER_CYCLE", "8"))
 
-def load_state():
+# ------------------------------------------------------------
+
+def tg_send(text: str) -> None:
+    if not BOT_TOKEN or not CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    try:
+        requests.post(url, json={"chat_id": CHAT_ID, "text": text[:3900]}, timeout=20)
+    except Exception:
+        pass
+
+def load_state() -> Dict[str, Any]:
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return {"seen_event_ids": [], "started_at": int(time.time())}
+        return {
+            "seen_event_ids": [],
+            "seen_market_ids": [],
+            "prices": {},  # market_id -> {"yes": float, "no": float, "ts": int}
+            "started_at": int(time.time())
+        }
 
-def save_state(state):
+def save_state(state: Dict[str, Any]) -> None:
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f)
 
-def fetch_active_events(limit=200, offset=0):
-    # Events actifs + non clos (c’est ce que tu veux)
-    params = {"active": "true", "closed": "false", "limit": limit, "offset": offset}
-    r = requests.get(f"{GAMMA}/events", params=params, timeout=20)
+def gamma_get(path: str, params: Dict[str, Any]) -> Any:
+    r = requests.get(f"{GAMMA}{path}", params=params, timeout=25)
     r.raise_for_status()
     return r.json()
 
+def fetch_active_events(limit: int, offset: int) -> List[Dict[str, Any]]:
+    # Doc: /events?active=true&closed=false&limit=&offset=
+    return gamma_get("/events", {
+        "active": "true",
+        "closed": "false",
+        "limit": limit,
+        "offset": offset
+    })
+
+def safe_lower_join(parts: List[str]) -> str:
+    return " ".join([p for p in parts if isinstance(p, str)]).lower()
+
+def match_keywords(text: str) -> List[str]:
+    hits = []
+    t = text.lower()
+    for k in KEYWORDS:
+        if k and k in t:
+            hits.append(k)
+    return hits
+
 def event_url(slug: str) -> str:
-    if slug:
-        return f"https://polymarket.com/event/{slug}"
-    return ""
+    return f"https://polymarket.com/event/{slug}" if slug else ""
 
 def market_url(slug: str) -> str:
-    if slug:
-        return f"https://polymarket.com/market/{slug}"
-    return ""
+    return f"https://polymarket.com/market/{slug}" if slug else ""
 
-def contains_btc(event: dict) -> bool:
-    # Cherche "btc/bitcoin" dans titre/description et dans les questions des markets de l’event
-    text_parts = []
+def parse_binary_prices(market: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    """
+    Essaie de récupérer un prix YES/NO depuis plusieurs champs possibles.
+    Gamma renvoie souvent outcomePrices (strings) pour les outcomes.
+    On fait du "best effort" : si on trouve 2 prix, on retourne (yes, no).
+    """
+    # 1) outcomePrices: ex ["0.62","0.38"]
+    op = market.get("outcomePrices") or market.get("outcome_prices")
+    if isinstance(op, list) and len(op) >= 2:
+        try:
+            yes = float(op[0])
+            no = float(op[1])
+            if 0 <= yes <= 1 and 0 <= no <= 1:
+                return yes, no
+        except Exception:
+            pass
+
+    # 2) outcomes + prices (parfois)
+    outcomes = market.get("outcomes")
+    prices = market.get("prices")
+    if isinstance(outcomes, list) and isinstance(prices, list) and len(outcomes) >= 2 and len(prices) >= 2:
+        try:
+            # on assume order YES, NO si binary
+            yes = float(prices[0])
+            no = float(prices[1])
+            if 0 <= yes <= 1 and 0 <= no <= 1:
+                return yes, no
+        except Exception:
+            pass
+
+    # 3) lastTradePrice / bestBid / bestAsk : si dispo en dict
+    # (on ne peut pas reconstruire NO facilement si on a qu'un seul côté)
+    return None
+
+def is_probably_binary_market(market: Dict[str, Any]) -> bool:
+    # best-effort: 2 outcomes ou outcomePrices length 2
+    op = market.get("outcomePrices") or market.get("outcome_prices")
+    if isinstance(op, list) and len(op) == 2:
+        return True
+    outs = market.get("outcomes")
+    if isinstance(outs, list) and len(outs) == 2:
+        return True
+    return False
+
+def summarize_market_text(event: Dict[str, Any], market: Dict[str, Any]) -> str:
+    parts = []
     for k in ["title", "description", "slug"]:
         v = event.get(k)
         if isinstance(v, str):
-            text_parts.append(v)
-
-    for m in (event.get("markets") or []):
-        for k in ["question", "title", "description", "slug"]:
-            v = m.get(k)
-            if isinstance(v, str):
-                text_parts.append(v)
-
-    text = " ".join(text_parts).lower()
-    return any(k in text for k in KEYWORDS)
-
-def pick_first_btc_market(event: dict):
-    for m in (event.get("markets") or []):
-        parts = []
-        for k in ["question", "title", "description", "slug"]:
-            v = m.get(k)
-            if isinstance(v, str):
-                parts.append(v)
-        if any(k in (" ".join(parts).lower()) for k in KEYWORDS):
-            return m
-    return (event.get("markets") or [None])[0]
+            parts.append(v)
+    for k in ["question", "title", "description", "slug"]:
+        v = market.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    return safe_lower_join(parts)
 
 def main():
     if not BOT_TOKEN or not CHAT_ID:
         print("❌ Il manque TELEGRAM_BOT_TOKEN ou TELEGRAM_CHAT_ID dans les variables d'env.")
-        print("PowerShell:")
-        print('$env:TELEGRAM_BOT_TOKEN="..."')
-        print('$env:TELEGRAM_CHAT_ID="..."')
         return
 
     state = load_state()
-    seen = set(state.get("seen_event_ids", []))
-    started_at = state.get("started_at", int(time.time()))
+    seen_events = set(state.get("seen_event_ids", []))
+    seen_markets = set(state.get("seen_market_ids", []))
+    prices_state: Dict[str, Any] = state.get("prices", {}) or {}
 
-    tg_send("✅ Bot BTC ON : je t’envoie une notif UNIQUEMENT quand un NOUVEAU pari actif contient BTC/Bitcoin.")
+    tg_send("✅ Polymarket Mega Scanner ON (BTC/ETH/SOL + arbitrage + spikes).")
 
     while True:
+        alerts_sent = 0
         try:
-            events = fetch_active_events(limit=200, offset=0)
+            for page in range(MAX_PAGES):
+                offset = page * LIMIT
+                events = fetch_active_events(LIMIT, offset)
+                if not events:
+                    break
 
-            for e in events:
-                eid = str(e.get("id") or "")
-                if not eid or eid in seen:
-                    continue
-
-                # “Nouveau depuis lancement” : si l’API donne une date, on s’en sert; sinon on garde juste seen.
-                # (Certaines réponses ont createdAt; on gère les deux cas)
-                created = e.get("createdAt") or e.get("created_at")
-                if isinstance(created, (int, float)) and created < started_at:
-                    # Event plus vieux que le lancement => on ignore
-                    seen.add(eid)
-                    continue
-
-                if contains_btc(e):
-                    title = e.get("title") or "(sans titre)"
+                for e in events:
+                    eid = str(e.get("id") or "")
                     eslug = e.get("slug") or ""
-                    m = pick_first_btc_market(e) or {}
-                    mslug = (m.get("slug") if isinstance(m, dict) else "") or ""
-                    q = (m.get("question") if isinstance(m, dict) else None) or ""
+                    etitle = e.get("title") or "(no title)"
 
-                    msg = "🟠 Nouveau pari BTC détecté:\n"
-                    msg += f"{title}\n"
-                    if q:
-                        msg += f"Market: {q}\n"
-                    if eslug:
-                        msg += f"Event: {event_url(eslug)}\n"
-                    if mslug:
-                        msg += f"Market: {market_url(mslug)}\n"
-                    msg += f"ID: {eid}"
-                    tg_send(msg)
+                    markets = e.get("markets") or []
+                    if not isinstance(markets, list):
+                        continue
 
-                # marque comme vu dans tous les cas
-                seen.add(eid)
+                    # --- NEW EVENT / KEYWORD ALERT (si event ou un de ses markets match) ---
+                    if eid and eid not in seen_events:
+                        # scan keywords across event + markets
+                        event_text_parts = []
+                        for k in ["title", "description", "slug"]:
+                            v = e.get(k)
+                            if isinstance(v, str):
+                                event_text_parts.append(v)
 
-            state["seen_event_ids"] = list(seen)[-2000:]  # limite mémoire
+                        mk_text_parts = []
+                        for m in markets[:10]:  # limite pour perf
+                            for k in ["question", "title", "description", "slug"]:
+                                v = m.get(k) if isinstance(m, dict) else None
+                                if isinstance(v, str):
+                                    mk_text_parts.append(v)
+
+                        combined = safe_lower_join(event_text_parts + mk_text_parts)
+                        hits = match_keywords(combined)
+
+                        if hits and alerts_sent < MAX_ALERTS_PER_CYCLE:
+                            hits_str = ", ".join(sorted(set(hits)))
+                            msg = (
+                                f"🟠 NEW CRYPTO EVENT ({hits_str})\n"
+                                f"{etitle}\n"
+                                f"{event_url(eslug)}\n"
+                                f"Event ID: {eid}"
+                            )
+                            tg_send(msg)
+                            alerts_sent += 1
+
+                        seen_events.add(eid)
+
+                    # --- MARKET LEVEL: spikes + arbitrage ---
+                    for m in markets:
+                        if not isinstance(m, dict):
+                            continue
+
+                        mid = str(m.get("id") or m.get("market_id") or "")
+                        mslug = m.get("slug") or ""
+                        q = m.get("question") or m.get("title") or "(no question)"
+
+                        # keyword filter: only watch markets matching keywords (keeps noise low)
+                        text = summarize_market_text(e, m)
+                        hits = match_keywords(text)
+                        if not hits:
+                            # on peut commenter cette ligne si tu veux scanner TOUS les marchés
+                            continue
+
+                        # mark seen market
+                        if mid:
+                            seen_markets.add(mid)
+
+                        # price tracking for binary markets only
+                        if not is_probably_binary_market(m):
+                            continue
+
+                        parsed = parse_binary_prices(m)
+                        if not parsed:
+                            continue
+
+                        yes, no = parsed
+                        if not (0 <= yes <= 1 and 0 <= no <= 1):
+                            continue
+
+                        now = int(time.time())
+                        prev = prices_state.get(mid)
+
+                        # --- SPIKE ALERT ---
+                        if isinstance(prev, dict):
+                            py = float(prev.get("yes", yes))
+                            pn = float(prev.get("no", no))
+                            if (abs(yes - py) >= SPIKE_DELTA or abs(no - pn) >= SPIKE_DELTA) and alerts_sent < MAX_ALERTS_PER_CYCLE:
+                                hits_str = ", ".join(sorted(set(hits)))
+                                msg = (
+                                    f"⚡ PRICE SPIKE ({hits_str})\n"
+                                    f"{q}\n"
+                                    f"YES: {py:.2f} → {yes:.2f} | NO: {pn:.2f} → {no:.2f}\n"
+                                    f"{market_url(mslug)}\n"
+                                    f"Market ID: {mid}"
+                                )
+                                tg_send(msg)
+                                alerts_sent += 1
+
+                        # --- ARBITRAGE ALERT (best-effort) ---
+                        # If YES+NO < 1 - EDGE_MIN -> possible arbitrage (à vérifier liquidité/spread)
+                        s = yes + no
+                        if s <= (1.0 - EDGE_MIN) and alerts_sent < MAX_ALERTS_PER_CYCLE:
+                            edge = 1.0 - s
+                            hits_str = ", ".join(sorted(set(hits)))
+                            msg = (
+                                f"💰 POSSIBLE ARB ({hits_str})\n"
+                                f"{q}\n"
+                                f"YES: {yes:.2f} | NO: {no:.2f} | Sum: {s:.2f}\n"
+                                f"Edge ~ {edge*100:.1f}% (verify spread/liquidity)\n"
+                                f"{market_url(mslug)}\n"
+                                f"Market ID: {mid}"
+                            )
+                            tg_send(msg)
+                            alerts_sent += 1
+
+                        # update price state
+                        prices_state[mid] = {"yes": yes, "no": no, "ts": now}
+
+            # persist state
+            state["seen_event_ids"] = list(seen_events)[-5000:]
+            state["seen_market_ids"] = list(seen_markets)[-10000:]
+            state["prices"] = prices_state
             save_state(state)
 
         except Exception as ex:
-            tg_send(f"⚠️ Bot erreur: {ex}")
+            tg_send(f"⚠️ Scanner error: {ex}")
 
         time.sleep(POLL_SECONDS)
 
